@@ -20,12 +20,97 @@ from typing import Any, Dict, List, Tuple
 
 from openstack_bi.config import neutron_db, parse_regions
 from openstack_bi.db import query
+from openstack_bi.util import format_region_errors, safe_for_each_region
 
 from .base import ChartSpec, Param, Report, ReportResult
 
 
 def _region_choices() -> List[Tuple[str, str]]:
     return [(r.name, r.name) for r in parse_regions()]
+
+
+def _collect_region(region) -> List[Dict[str, Any]]:
+    """Gather one region's per-external-network FIP pool utilization rows."""
+    fip_rows = query(
+        region, neutron_db(),
+        """
+        SELECT floating_network_id AS network_id,
+               SUM(CASE WHEN fixed_port_id IS NOT NULL THEN 1 ELSE 0 END) AS bound,
+               SUM(CASE WHEN fixed_port_id IS NULL     THEN 1 ELSE 0 END) AS unbound,
+               COUNT(*) AS allocated
+        FROM floatingips
+        GROUP BY floating_network_id
+        """,
+    )
+    network_ids = {r["network_id"] for r in fip_rows}
+    if not network_ids:
+        return []
+
+    ph = ",".join(["%s"] * len(network_ids))
+
+    # Pool size per network. An older Neutron without `ipallocationpools`
+    # simply reports pool_size=0 (flagged as 'no declared pool' below).
+    pool_by_network: Dict[str, int] = {}
+    try:
+        pool_rows = query(
+            region, neutron_db(),
+            f"""
+            SELECT s.network_id AS network_id,
+                   COALESCE(SUM(INET_ATON(p.last_ip) - INET_ATON(p.first_ip) + 1), 0) AS pool_size
+            FROM ipallocationpools p
+            JOIN subnets s ON s.id = p.subnet_id
+            WHERE s.ip_version = 4
+              AND s.network_id IN ({ph})
+            GROUP BY s.network_id
+            """,
+            list(network_ids),
+        )
+        pool_by_network = {r["network_id"]: int(r["pool_size"] or 0) for r in pool_rows}
+    except Exception as exc:  # noqa: BLE001
+        # Re-raise anything that looks like an auth/connection issue so the
+        # per-region safety net records the region as failed. Silently
+        # tolerate schema mismatches only.
+        msg = str(exc).lower()
+        if "access denied" in msg or "can't connect" in msg or "connection" in msg:
+            raise
+
+    name_rows = query(
+        region, neutron_db(),
+        f"SELECT id, name FROM networks WHERE id IN ({ph})",
+        list(network_ids),
+    )
+    network_names = {r["id"]: r["name"] for r in name_rows}
+
+    fip_by_net = {r["network_id"]: r for r in fip_rows}
+    region_rows: List[Dict[str, Any]] = []
+    for net_id in network_ids:
+        fip_row = fip_by_net.get(net_id, {})
+        pool_size = pool_by_network.get(net_id, 0)
+        allocated = int(fip_row.get("allocated") or 0)
+        bound = int(fip_row.get("bound") or 0)
+        unbound = int(fip_row.get("unbound") or 0)
+        free = pool_size - allocated
+        pct = round((allocated / pool_size) * 100, 1) if pool_size else None
+        status_note = "ok"
+        if pool_size == 0 and allocated > 0:
+            status_note = "no declared pool"
+        elif pct is not None and pct >= 95:
+            status_note = "near-full"
+        elif pct is not None and pct >= 80:
+            status_note = "warn"
+        region_rows.append({
+            "region": region.name,
+            "network_id": net_id,
+            "network_name": network_names.get(net_id) or "",
+            "pool_size": pool_size,
+            "allocated": allocated,
+            "bound": bound,
+            "unbound": unbound,
+            "free": max(free, 0),
+            "pct_used": pct if pct is not None else "-",
+            "status": status_note,
+        })
+    return region_rows
 
 
 class FipPoolsReport(Report):
@@ -55,84 +140,10 @@ class FipPoolsReport(Report):
             by_name = {r.name: r for r in all_regions}
             selected_regions = [by_name[n] for n in selected_region_names if n in by_name]
 
+        results, region_errors = safe_for_each_region(selected_regions, _collect_region)
         rows_out: List[Dict[str, Any]] = []
-
-        for region in selected_regions:
-            # FIP counts per network, split by bound/unbound. We restrict the
-            # pool/name lookups to networks with at least one FIP allocation
-            # — otherwise we'd list every tenant's internal network that
-            # happens to have a v4 allocation pool, which is almost always
-            # noise for this report.
-            fip_rows = query(
-                region, neutron_db(),
-                """
-                SELECT floating_network_id AS network_id,
-                       SUM(CASE WHEN fixed_port_id IS NOT NULL THEN 1 ELSE 0 END) AS bound,
-                       SUM(CASE WHEN fixed_port_id IS NULL     THEN 1 ELSE 0 END) AS unbound,
-                       COUNT(*) AS allocated
-                FROM floatingips
-                GROUP BY floating_network_id
-                """,
-            )
-            network_ids = {r["network_id"] for r in fip_rows}
-
-            pool_by_network: Dict[str, int] = {}
-            network_names: Dict[str, str] = {}
-            if network_ids:
-                ph = ",".join(["%s"] * len(network_ids))
-                try:
-                    pool_rows = query(
-                        region, neutron_db(),
-                        f"""
-                        SELECT s.network_id AS network_id,
-                               COALESCE(SUM(INET_ATON(p.last_ip) - INET_ATON(p.first_ip) + 1), 0) AS pool_size
-                        FROM ipallocationpools p
-                        JOIN subnets s ON s.id = p.subnet_id
-                        WHERE s.ip_version = 4
-                          AND s.network_id IN ({ph})
-                        GROUP BY s.network_id
-                        """,
-                        list(network_ids),
-                    )
-                    pool_by_network = {r["network_id"]: int(r["pool_size"] or 0) for r in pool_rows}
-                except Exception:  # noqa: BLE001
-                    pool_by_network = {}
-
-                name_rows = query(
-                    region, neutron_db(),
-                    f"SELECT id, name FROM networks WHERE id IN ({ph})",
-                    list(network_ids),
-                )
-                network_names = {r["id"]: r["name"] for r in name_rows}
-            fip_by_net = {r["network_id"]: r for r in fip_rows}
-
-            for net_id in network_ids:
-                fip_row = fip_by_net.get(net_id, {})
-                pool_size = pool_by_network.get(net_id, 0)
-                allocated = int(fip_row.get("allocated") or 0)
-                bound = int(fip_row.get("bound") or 0)
-                unbound = int(fip_row.get("unbound") or 0)
-                free = pool_size - allocated
-                pct = round((allocated / pool_size) * 100, 1) if pool_size else None
-                status_note = "ok"
-                if pool_size == 0 and allocated > 0:
-                    status_note = "no declared pool"
-                elif pct is not None and pct >= 95:
-                    status_note = "near-full"
-                elif pct is not None and pct >= 80:
-                    status_note = "warn"
-                rows_out.append({
-                    "region": region.name,
-                    "network_id": net_id,
-                    "network_name": network_names.get(net_id) or "",
-                    "pool_size": pool_size,
-                    "allocated": allocated,
-                    "bound": bound,
-                    "unbound": unbound,
-                    "free": max(free, 0),
-                    "pct_used": pct if pct is not None else "-",
-                    "status": status_note,
-                })
+        for _, region_rows in results:
+            rows_out.extend(region_rows)
 
         rows_out.sort(key=lambda r: (
             r["region"],
@@ -160,6 +171,7 @@ class FipPoolsReport(Report):
             "total_pool_size": sum(r["pool_size"] for r in rows_out),
             "total_allocated": sum(r["allocated"] for r in rows_out),
             "total_unbound": sum(r["unbound"] for r in rows_out),
+            "region_errors": format_region_errors(region_errors),
         }
 
         stem_bits = ["fip-pools"]
