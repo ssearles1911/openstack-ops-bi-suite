@@ -18,6 +18,7 @@ from . import fip_audit  # noqa: F401
 from . import fip_pools  # noqa: F401
 from . import instance_history  # noqa: F401
 from . import instance_leaderboard  # noqa: F401
+from . import issues  # noqa: F401
 from . import project_growth  # noqa: F401
 from . import qemu_lifetime  # noqa: F401
 from . import snapshot_leaderboard  # noqa: F401
@@ -26,6 +27,7 @@ from . import volume_history  # noqa: F401
 from . import volume_resizes  # noqa: F401
 
 _ORDER = [
+    issues,
     qemu_lifetime,
     instance_leaderboard,
     project_growth,
