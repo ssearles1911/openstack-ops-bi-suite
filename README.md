@@ -128,7 +128,7 @@ $EDITOR .env
 `.env` is gitignored. Overriding for a single run:
 
 ```
-OS_DB_PASSWORD__DFW1=oneoff python qemu_lifetime_report.py --list-domains
+OS_DB_PASSWORD__DFW1=oneoff opsbi list-domains
 ```
 
 ## CLI usage
