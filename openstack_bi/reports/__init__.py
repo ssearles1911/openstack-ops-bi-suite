@@ -14,6 +14,8 @@ from .base import Report
 
 # --- Report imports ---------------------------------------------------------
 # The CLI and web UI enumerate reports in the order they appear in `_ORDER`.
+from . import fip_audit  # noqa: F401
+from . import fip_pools  # noqa: F401
 from . import instance_leaderboard  # noqa: F401
 from . import project_growth  # noqa: F401
 from . import qemu_lifetime  # noqa: F401
@@ -26,6 +28,8 @@ _ORDER = [
     project_growth,
     snapshot_leaderboard,
     stale_snapshots,
+    fip_audit,
+    fip_pools,
 ]
 
 
