@@ -5,13 +5,17 @@ Lists Keystone domains, lets you pick one (or pass --domain), then prints
 every instance in that domain's projects along with its most recent
 lifecycle action and how long ago it occurred.
 
+By default the report spans every region configured in `.env`. Use --region
+(repeatable) to scope it to specific regions, or --all-regions for the
+default.
+
 By default only instances in vm_state=active are reported. Use --state
 (repeatable) to pick other states, or --all-states to disable filtering.
 
 Optionally filters with --days to surface instances with no qualifying
 event in the last N days.
 
-DB connection config lives in `core.py` (env vars).
+DB connection config lives in `openstack_bi.config` (env vars / `.env`).
 """
 
 import argparse
@@ -22,6 +26,7 @@ from typing import Any, Dict, List, Optional
 import pymysql
 
 import core
+from openstack_bi.config import parse_regions, resolve_regions
 
 
 def pick_domain_interactively(domains: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -60,10 +65,12 @@ def render_grouped(
     rows: List[Dict[str, Any]],
     days_filter: Optional[int],
     state_filter: Optional[List[str]],
+    region_filter: Optional[List[str]],
 ) -> str:
     cols = [
         ("uuid", "uuid", 36),
         ("name", "name", 24),
+        ("region", "region", 10),
         ("compute_host", "host", 14),
         ("vm_state", "state", 9),
         ("last_action", "last_action", 14),
@@ -76,6 +83,10 @@ def render_grouped(
         by_project[r["project_id"]].append(r)
 
     out: List[str] = [f"Domain: {domain['name']}  (id: {domain['id']})"]
+    if region_filter:
+        out.append(f"Regions: {', '.join(region_filter)}")
+    else:
+        out.append("Regions: (all configured)")
     if state_filter:
         out.append(f"State filter: {', '.join(state_filter)}")
     else:
@@ -122,16 +133,38 @@ def main() -> int:
                          "Use --all-states to disable filtering."))
     p.add_argument("--all-states", action="store_true",
                    help="Show instances in any vm_state (overrides --state)")
+    p.add_argument("--region", action="append", metavar="REGION",
+                   help=("Limit to this region (by name). Repeatable. "
+                         "Defaults to all configured regions."))
+    p.add_argument("--all-regions", action="store_true",
+                   help="Span every configured region (default; overrides --region)")
     p.add_argument("--list-domains", action="store_true",
                    help="List domains and exit")
+    p.add_argument("--list-regions", action="store_true",
+                   help="List configured regions and exit")
     p.add_argument("--list-cells", action="store_true",
-                   help="List discovered cell DBs and exit")
+                   help="List discovered cell DBs per region and exit")
     args = p.parse_args()
 
     try:
+        if args.list_regions:
+            for r in parse_regions():
+                print(f"{r.name:<16}  {r.host}:{r.port}  user={r.user}")
+            return 0
+
+        if args.all_regions:
+            selected_region_names: Optional[List[str]] = None
+        elif args.region:
+            selected_region_names = list(args.region)
+        else:
+            selected_region_names = None
+
+        regions = resolve_regions(selected_region_names)
+
         if args.list_cells:
-            for c in core.list_cell_dbs():
-                print(c)
+            for region in regions:
+                for cell in core.list_cells(region):
+                    print(f"{region.name}\t{cell}")
             return 0
 
         domains = core.list_domains()
@@ -165,11 +198,20 @@ def main() -> int:
             return 0
 
         project_ids = [p["id"] for p in projects]
+        name_by_id = {p["id"]: p["name"] for p in projects}
+
         rows: List[Dict[str, Any]] = []
-        for cell in core.list_cell_dbs():
-            rows.extend(core.fetch_instances(cell, project_ids, days, vm_states))
+        for region in regions:
+            for cell in core.list_cells(region):
+                rows.extend(core.fetch_instances(region, cell, project_ids, days, vm_states))
+        for row in rows:
+            row["project_name"] = name_by_id.get(row["project_id"])
         core.annotate_ages(rows)
-        print(render_grouped(domain, projects, rows, days, vm_states))
+
+        print(render_grouped(
+            domain, projects, rows, days, vm_states,
+            [r.name for r in regions] if selected_region_names is not None else None,
+        ))
         return 0
 
     except pymysql.MySQLError as exc:

@@ -25,6 +25,19 @@
     border: 1px solid rgba(127,127,127,0.5);
     background: inherit; color: inherit;
   }
+  form fieldset.regions {
+    margin: 0; padding: 0.35rem 0.6rem; border-radius: 4px;
+    border: 1px solid rgba(127,127,127,0.5);
+    display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;
+  }
+  form fieldset.regions legend {
+    font-size: 0.78rem; padding: 0 0.3rem;
+    color: rgba(127,127,127,1);
+  }
+  form fieldset.regions label {
+    flex-direction: row; align-items: center; gap: 0.25rem;
+    font-size: 0.88rem;
+  }
   /* Native <option> ignores inherited colors and falls back to its own
      defaults, which clash with dark mode. Canvas/CanvasText follow the
      OS theme and keep dropdown entries readable in both modes. */
@@ -97,10 +110,20 @@
     <label>Min days since last event
       <input type="number" name="days" min="0" value="{{ days }}" placeholder="any">
     </label>
+    <fieldset class="regions">
+      <legend>Regions</legend>
+      {% for r in all_regions %}
+        <label>
+          <input type="checkbox" name="region" value="{{ r.name }}"
+                 {% if r.name in selected_regions %}checked{% endif %}>
+          {{ r.name }}
+        </label>
+      {% endfor %}
+    </fieldset>
     <button type="submit">Run report</button>
     {% if domain %}
       <a class="btn"
-         href="/export.xlsx?domain={{ selected_domain|urlencode }}&amp;state={{ selected_state|urlencode }}{% if days != '' %}&amp;days={{ days }}{% endif %}">
+         href="/export.xlsx?domain={{ selected_domain|urlencode }}&amp;state={{ selected_state|urlencode }}{% if days != '' %}&amp;days={{ days }}{% endif %}{% if not regions_all_selected %}{% for r in display_regions %}&amp;region={{ r|urlencode }}{% endfor %}{% endif %}">
         Download Excel
       </a>
     {% endif %}
@@ -115,6 +138,8 @@
       <strong>Domain:</strong> {{ domain.name }}
       &nbsp;·&nbsp; <strong>Projects:</strong> {{ projects|length }}
       &nbsp;·&nbsp; <strong>Instances reported:</strong> {{ total }}
+      &nbsp;·&nbsp; <strong>Regions:</strong>
+      {% if regions_all_selected %}(all){% else %}{{ display_regions|join(', ') }}{% endif %}
       &nbsp;·&nbsp; <strong>State:</strong>
       {% if selected_state == all_states_sentinel %}(all){% else %}{{ selected_state }}{% endif %}
       {% if days != '' %}
@@ -137,6 +162,7 @@
               <thead>
                 <tr>
                   <th>Instance</th>
+                  <th>Region</th>
                   <th>Host</th>
                   <th>State</th>
                   <th>Last action</th>
@@ -151,6 +177,7 @@
                       <div>{{ r.name or '-' }}</div>
                       <div class="uuid">{{ r.uuid }}</div>
                     </td>
+                    <td>{{ r.region or '-' }}</td>
                     <td>{{ r.compute_host or '-' }}</td>
                     <td>{{ r.vm_state or '-' }}</td>
                     <td>{{ r.last_action }}</td>

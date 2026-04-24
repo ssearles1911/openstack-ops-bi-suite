@@ -1,33 +1,46 @@
 """Shared DB + query logic for the QEMU lifetime report.
 
 Used by both the CLI (`qemu_lifetime_report.py`) and the web UI (`web.py`).
-All OpenStack DBs (keystone, nova_api, nova_cell*) are expected to live on
-one MariaDB replica reachable with a single set of credentials.
+All OpenStack DBs live on a MariaDB replica *per region*; Keystone is shared
+across regions and lives on one nominated region's replica (see
+`openstack_bi.config`).
 
-Config (env vars; auto-loaded from `.env` in the CWD if present):
-    OS_DB_HOST       (default 127.0.0.1)
-    OS_DB_PORT       (default 3306)
-    OS_DB_USER       (default nova)
-    OS_DB_PASSWORD   (default empty)
-    KEYSTONE_DB      (default keystone)
-    NOVA_API_DB      (default nova_api)
+Config for connections, regions, and Keystone placement is handled by the
+`openstack_bi` package. This module is concerned with domain/project/instance
+queries and the lifecycle-action semantics specific to the QEMU report.
 """
 
-import os
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from __future__ import annotations
 
-import pymysql
-import pymysql.cursors
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# Load .env from CWD (or any parent) before any os.environ.get() runs.
-# Real env vars take precedence over .env entries.
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from openstack_bi.config import (
+    Region,
+    keystone_db,
+    keystone_region,
+    nova_api_db,
+    parse_regions,
+    resolve_regions,
+)
+from openstack_bi.db import query
+from openstack_bi.util import annotate_ages, humanize  # re-exported for compat
+
+__all__ = [
+    "LIFECYCLE_ACTIONS",
+    "COMMON_VM_STATES",
+    "DEFAULT_VM_STATES",
+    "annotate_ages",
+    "humanize",
+    "list_domains",
+    "find_domain",
+    "list_projects",
+    "list_cells",
+    "fetch_instances",
+    "collect_report",
+    "parse_regions",
+    "resolve_regions",
+    "keystone_region",
+]
 
 
 # Nova action names that count as a QEMU lifecycle event for this report.
@@ -63,38 +76,12 @@ COMMON_VM_STATES: Tuple[str, ...] = (
 DEFAULT_VM_STATES: Tuple[str, ...] = ("active",)
 
 
-def db_params(database: Optional[str] = None) -> Dict[str, Any]:
-    return {
-        "host": os.environ.get("OS_DB_HOST", "127.0.0.1"),
-        "port": int(os.environ.get("OS_DB_PORT", "3306")),
-        "user": os.environ.get("OS_DB_USER", "nova"),
-        "password": os.environ.get("OS_DB_PASSWORD", ""),
-        "database": database,
-        "charset": "utf8mb4",
-        "cursorclass": pymysql.cursors.DictCursor,
-    }
-
-
-def keystone_db() -> str:
-    return os.environ.get("KEYSTONE_DB", "keystone")
-
-
-def nova_api_db() -> str:
-    return os.environ.get("NOVA_API_DB", "nova_api")
-
-
-def query(database: str, sql: str, args: Sequence[Any] = ()) -> List[Dict[str, Any]]:
-    conn = pymysql.connect(**db_params(database))
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, args)
-            return list(cur.fetchall())
-    finally:
-        conn.close()
-
-
 def list_domains() -> List[Dict[str, Any]]:
-    """Domains in Keystone are rows in `project` with is_domain=1."""
+    """Domains in Keystone are rows in `project` with is_domain=1.
+
+    Keystone is shared across regions — we hit the region configured via
+    `KEYSTONE_REGION` (or the first configured region by default).
+    """
     sql = """
         SELECT d.id, d.name,
                (SELECT COUNT(*) FROM project p
@@ -104,7 +91,7 @@ def list_domains() -> List[Dict[str, Any]]:
         WHERE d.is_domain = 1 AND d.enabled = 1
         ORDER BY d.name
     """
-    return query(keystone_db(), sql)
+    return query(keystone_region(), keystone_db(), sql)
 
 
 def find_domain(needle: str) -> Optional[Dict[str, Any]]:
@@ -115,7 +102,7 @@ def find_domain(needle: str) -> Optional[Dict[str, Any]]:
         WHERE is_domain = 1 AND enabled = 1 AND (id = %s OR name = %s)
         LIMIT 1
     """
-    rows = query(keystone_db(), sql, (needle, needle))
+    rows = query(keystone_region(), keystone_db(), sql, (needle, needle))
     return rows[0] if rows else None
 
 
@@ -126,12 +113,15 @@ def list_projects(domain_id: str) -> List[Dict[str, Any]]:
         WHERE domain_id = %s AND is_domain = 0 AND enabled = 1
         ORDER BY name
     """
-    return query(keystone_db(), sql, (domain_id,))
+    return query(keystone_region(), keystone_db(), sql, (domain_id,))
 
 
-def list_cell_dbs() -> List[str]:
-    """Discover cell DB names from `nova_api.cell_mappings`."""
+def list_cells(region: Region) -> List[str]:
+    """Discover cell DB names for one region from its `nova_api.cell_mappings`."""
+    from urllib.parse import urlparse
+
     rows = query(
+        region,
         nova_api_db(),
         "SELECT name, database_connection FROM cell_mappings ORDER BY id",
     )
@@ -147,25 +137,26 @@ def list_cell_dbs() -> List[str]:
 
 
 def fetch_instances(
+    region: Region,
     cell_db: str,
     project_ids: Sequence[str],
     days: Optional[int],
     vm_states: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Active instances in the given projects with their most-recent
-    lifecycle action, scoped to one cell DB. Cross-DB join into keystone
-    for project name (all DBs live on the same MariaDB server).
+    """Instances in the given projects with their most-recent lifecycle
+    action, scoped to one cell DB within one region.
 
-    `vm_states` filters by `instances.vm_state`. None or empty means
-    no state filter (return instances in any state). Pass an explicit
-    sequence (e.g. `("active",)`) to restrict.
+    Keystone is shared across regions and may live on a different replica
+    than this region's Nova data, so we do *not* cross-DB-join into
+    `keystone.project` here. Callers are expected to resolve project names
+    from the shared Keystone separately (see `collect_report`), which is
+    also cheaper: one lookup per project, not one join per row.
     """
     if not project_ids:
         return []
 
     proj_ph = ",".join(["%s"] * len(project_ids))
     act_ph = ",".join(["%s"] * len(LIFECYCLE_ACTIONS))
-    ks = keystone_db()
 
     sql = f"""
         WITH project_instances AS (
@@ -193,14 +184,12 @@ def fetch_instances(
             i.power_state                           AS power_state,
             i.created_at                            AS created_at,
             i.project_id                            AS project_id,
-            p.name                                  AS project_name,
             r.action                                AS last_action,
             r.start_time                            AS last_action_time,
             r.user_id                               AS last_action_user,
             COALESCE(r.start_time, i.created_at)    AS effective_time
         FROM instances i
         LEFT JOIN ranked r ON r.instance_uuid = i.uuid AND r.rn = 1
-        LEFT JOIN {ks}.project p ON p.id = i.project_id
         WHERE i.deleted = 0
           AND i.project_id IN ({proj_ph})
     """
@@ -216,61 +205,52 @@ def fetch_instances(
         sql += " AND COALESCE(r.start_time, i.created_at) < (UTC_TIMESTAMP() - INTERVAL %s DAY)"
         args.append(days)
 
-    sql += " ORDER BY p.name, effective_time"
-    return query(cell_db, sql, args)
-
-
-def humanize(seconds: Optional[float]) -> str:
-    if seconds is None:
-        return "-"
-    s = int(seconds)
-    d, s = divmod(s, 86400)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    if d:
-        return f"{d}d {h}h"
-    if h:
-        return f"{h}h {m}m"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
-def annotate_ages(rows: Iterable[Dict[str, Any]]) -> None:
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    for r in rows:
-        eff = r.get("effective_time")
-        if eff is None:
-            r["age_seconds"] = None
-            r["age"] = "-"
-        else:
-            r["age_seconds"] = (now - eff).total_seconds()
-            r["age"] = humanize(r["age_seconds"])
-        if r.get("last_action") is None:
-            r["last_action"] = "(none recorded)"
+    sql += " ORDER BY i.project_id, effective_time"
+    rows = query(region, cell_db, sql, args)
+    # Tag every row with the region it came from so multi-region aggregates
+    # can render a `region` column downstream.
+    for row in rows:
+        row["region"] = region.name
+    return rows
 
 
 def collect_report(
     domain_selector: str,
     days: Optional[int],
     vm_states: Optional[Sequence[str]] = None,
+    selected_regions: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Resolve a domain by name/id, then fetch + annotate every instance
-    in its projects across all cells. Returns a dict with keys:
+    """Resolve a domain by name/id, then fetch + annotate every instance in
+    its projects across the selected regions (all regions by default).
+
+    Returns a dict with keys:
         domain    — dict or None if not found
-        projects  — list of project dicts (sorted by name)
-        rows      — list of instance dicts (annotated with age)
+        projects  — list of project dicts (sorted by name; Keystone is shared
+                    so this list is region-independent)
+        rows      — list of instance dicts (each tagged with `region`;
+                    annotated with `age_seconds` and `age`)
+        regions   — list of Region objects queried
 
     `vm_states` filters by `instances.vm_state`. None/empty disables the
     filter; callers wanting "active only" should pass DEFAULT_VM_STATES.
     """
+    regions = resolve_regions(list(selected_regions) if selected_regions else None)
     domain = find_domain(domain_selector)
     if domain is None:
-        return {"domain": None, "projects": [], "rows": []}
+        return {"domain": None, "projects": [], "rows": [], "regions": regions}
     projects = list_projects(domain["id"])
     project_ids = [p["id"] for p in projects]
+    name_by_id = {p["id"]: p["name"] for p in projects}
+
     rows: List[Dict[str, Any]] = []
-    for cell in list_cell_dbs():
-        rows.extend(fetch_instances(cell, project_ids, days, vm_states))
+    for region in regions:
+        for cell in list_cells(region):
+            rows.extend(fetch_instances(region, cell, project_ids, days, vm_states))
+
+    # Resolve project names from the shared Keystone map (Keystone is not
+    # cross-DB-joined in the cell query; see `fetch_instances` docstring).
+    for row in rows:
+        row["project_name"] = name_by_id.get(row["project_id"])
+
     annotate_ages(rows)
-    return {"domain": domain, "projects": projects, "rows": rows}
+    return {"domain": domain, "projects": projects, "rows": rows, "regions": regions}

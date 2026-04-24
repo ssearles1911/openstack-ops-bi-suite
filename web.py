@@ -2,23 +2,23 @@
 """Flask web UI for the QEMU lifetime report.
 
 Routes:
-    GET /                  — domain dropdown + days filter; renders the
-                              grouped report when ?domain=... is set.
+    GET /                  — domain dropdown, region checkboxes, state +
+                              days filters; renders the grouped report when
+                              ?domain=... is set.
     GET /export.xlsx       — same params, returns an Excel workbook.
 
 Run:
     python web.py
     QLR_HOST=0.0.0.0 QLR_PORT=8000 python web.py
 
-DB connection comes from `core.py` env vars (OS_DB_*, KEYSTONE_DB,
-NOVA_API_DB).
+DB connection config comes from `openstack_bi.config` (env vars / `.env`).
 """
 
 import io
 import os
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, abort, render_template, request, send_file
 from openpyxl import Workbook
@@ -26,6 +26,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 import core
+from openstack_bi.config import parse_regions, resolve_regions
 
 
 app = Flask(__name__)
@@ -44,7 +45,7 @@ def _parse_days(raw: Optional[str]) -> Optional[int]:
         return None
 
 
-def _parse_state(raw: Optional[str]) -> (Optional[List[str]], str):
+def _parse_state(raw: Optional[str]) -> Tuple[Optional[List[str]], str]:
     """Resolve the `state` query arg into (vm_states, selected_state).
 
     `vm_states` is what core.collect_report() expects: None means "any
@@ -61,12 +62,33 @@ def _parse_state(raw: Optional[str]) -> (Optional[List[str]], str):
     return [raw], raw
 
 
+def _parse_regions_param(
+    raw: List[str], all_regions: List[Any],
+) -> Tuple[Optional[List[str]], List[str]]:
+    """Resolve the repeated `region` query args into
+    (selected_regions_or_None, display_list).
+
+    Empty list → None (all regions). Unknown names are silently dropped
+    so stale bookmarks don't 500; the display list reflects the *valid*
+    subset that was submitted.
+    """
+    known = {r.name for r in all_regions}
+    cleaned = [r for r in raw if r in known]
+    if not cleaned or len(cleaned) == len(all_regions):
+        return None, [r.name for r in all_regions]
+    return cleaned, cleaned
+
+
 @app.route("/")
 def index():
+    all_regions = parse_regions()
     domains = core.list_domains()
     domain_sel = request.args.get("domain", "").strip()
     days = _parse_days(request.args.get("days"))
     vm_states, selected_state = _parse_state(request.args.get("state"))
+    selected_regions, display_regions = _parse_regions_param(
+        request.args.getlist("region"), all_regions,
+    )
 
     context: Dict[str, Any] = {
         "domains": domains,
@@ -76,6 +98,10 @@ def index():
         "common_vm_states": core.COMMON_VM_STATES,
         "selected_state": selected_state,
         "all_states_sentinel": ALL_STATES_SENTINEL,
+        "all_regions": all_regions,
+        "selected_regions": set(selected_regions) if selected_regions else {r.name for r in all_regions},
+        "regions_all_selected": selected_regions is None,
+        "display_regions": display_regions,
         "domain": None,
         "projects": [],
         "rows_by_project": {},
@@ -84,7 +110,7 @@ def index():
     }
 
     if domain_sel:
-        report = core.collect_report(domain_sel, days, vm_states)
+        report = core.collect_report(domain_sel, days, vm_states, selected_regions)
         if report["domain"] is None:
             context["error"] = f"Domain not found: {domain_sel}"
         else:
@@ -101,18 +127,23 @@ def index():
 
 @app.route("/export.xlsx")
 def export_xlsx():
+    all_regions = parse_regions()
     domain_sel = request.args.get("domain", "").strip()
     if not domain_sel:
         abort(400, "Missing 'domain' parameter")
     days = _parse_days(request.args.get("days"))
     vm_states, selected_state = _parse_state(request.args.get("state"))
+    selected_regions, display_regions = _parse_regions_param(
+        request.args.getlist("region"), all_regions,
+    )
 
-    report = core.collect_report(domain_sel, days, vm_states)
+    report = core.collect_report(domain_sel, days, vm_states, selected_regions)
     if report["domain"] is None:
         abort(404, f"Domain not found: {domain_sel}")
 
     bio = _build_workbook(
-        report["domain"], report["projects"], report["rows"], days, vm_states,
+        report["domain"], report["projects"], report["rows"],
+        days, vm_states, display_regions,
     )
 
     bits = [report["domain"]["name"], "qemu-lifetime"]
@@ -120,6 +151,10 @@ def export_xlsx():
         bits.append("-".join(vm_states))
     else:
         bits.append("all-states")
+    if selected_regions:
+        bits.append("-".join(selected_regions))
+    else:
+        bits.append("all-regions")
     if days is not None:
         bits.append(f"{days}d")
     filename = "-".join(bits) + ".xlsx"
@@ -138,6 +173,7 @@ def _build_workbook(
     rows: List[Dict[str, Any]],
     days: Optional[int],
     vm_states: Optional[List[str]],
+    display_regions: List[str],
 ) -> io.BytesIO:
     wb = Workbook()
     ws = wb.active
@@ -146,6 +182,7 @@ def _build_workbook(
     # Top-of-sheet metadata block (above the headered table).
     ws.append([f"Domain: {domain['name']}"])
     ws.append([f"Domain ID: {domain['id']}"])
+    ws.append([f"Regions: {', '.join(display_regions) if display_regions else '(none)'}"])
     state_desc = ", ".join(vm_states) if vm_states else "(all states)"
     ws.append([f"State filter: {state_desc}"])
     if days is not None:
@@ -155,7 +192,7 @@ def _build_workbook(
     ws.append([])
 
     headers = [
-        "project_name", "project_id", "instance_uuid", "instance_name",
+        "project_name", "project_id", "region", "instance_uuid", "instance_name",
         "compute_host", "vm_state", "power_state",
         "last_action", "last_action_time", "last_action_user",
         "age_days", "age", "created_at",
@@ -175,7 +212,8 @@ def _build_workbook(
     def _sort_key(r: Dict[str, Any]):
         return (
             proj_name_by_id.get(r.get("project_id"), "") or "",
-            -(r.get("age_seconds") or 0),  # oldest first within a project
+            r.get("region") or "",
+            -(r.get("age_seconds") or 0),  # oldest first within a (project, region)
         )
 
     for r in sorted(rows, key=_sort_key):
@@ -185,6 +223,7 @@ def _build_workbook(
         ws.append([
             r.get("project_name") or proj_name_by_id.get(r.get("project_id"), ""),
             r.get("project_id"),
+            r.get("region"),
             r.get("uuid"),
             r.get("name"),
             r.get("compute_host"),
