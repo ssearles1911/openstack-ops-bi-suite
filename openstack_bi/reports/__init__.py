@@ -17,8 +17,16 @@ from .base import Report
 from . import instance_leaderboard  # noqa: F401
 from . import project_growth  # noqa: F401
 from . import qemu_lifetime  # noqa: F401
+from . import snapshot_leaderboard  # noqa: F401
+from . import stale_snapshots  # noqa: F401
 
-_ORDER = [qemu_lifetime, instance_leaderboard, project_growth]
+_ORDER = [
+    qemu_lifetime,
+    instance_leaderboard,
+    project_growth,
+    snapshot_leaderboard,
+    stale_snapshots,
+]
 
 
 def all_reports() -> List[Report]:
